@@ -54,4 +54,310 @@ IKEv2 имеет нативную поддержку в большинстве �
 Чтобы настроить на своём мобильном устройстве данный протокол, необходимо будет установить клиент, что тоже не всегда возможно в силу обстоятельств.
 И вот опять, необходимость установки дополнительного клиента на устройство отметает все шансы на использование этого протокола в наших целях.
 
+В итоге, мы решили остановится на **IKEv2/IPSe**, по следующим причинам:
+* Поддержка Mobility and Multi-homing Protocol (MOBIKE).
+* Нативная поддержка в большинстве операционных систем.
+* Обеспечивает высокую скорость соединения.
+* Не требователен к ресурсам сервера.
 
+Перейдём от теории к практике.
+
+## Настраиваем VPN-сервер
+
+Прежде чем приступить к настройке сервера, необходимо определиться где мы будем размещать наш(ы) сервер(а).
+Самый простой критерий выбора расположения сервера, это удалённость от вас, т.е. если будет выбор между размещением сервера в германии или в США, то своё предпочтение следует отдать Германии (если вы находитель в России), т.к. в теории ваш траффик будет проходить через меньше кол-во магистралей и будет идти по более короткому маршруту.
+
+Для личного использования или небольшого кол-ва пользователей подойдёт самый простой вариант сервера, к примеру на digitalocean можно взять самую базовую конфигурацию сервера с одним ядром, 1 Gb оперативной памяти и 25 Gb дискового пространства.
+
+От слов к практике, каких-то особых навыков и тайных знаний для настройки VPN-сервера не понадобится.
+
+Для установки и настройки сервера будем пользовать следующие инструменты:
+* Docker + docker-compose.
+* strongswan - реализацию IPSec сервера.
+* Let's Encrypt - для генереции сертификатов.
+* Radius - для мониторинга и отправки статистических данных.
+
+Начнём с Docker контэйнера, в котором и будет запускаться vpn-сервер.
+
+    FROM alpine:latest #сервер будем собирать на основе образа alpine-linux
+
+    ENV VPNHOST ''
+    ENV LEEMAIL ''
+    ENV TZ=Europe/Moscow
+
+    # strongSwan Version
+    ARG SS_VERSION="https://download.strongswan.org/strongswan-5.8.2.tar.gz" #версию можете выбрать сами, исходя из того когда вы читаете данную статью.
+    ARG BUILD_DEPS="gettext"
+    ARG RUNTIME_DEPS="libintl"
+
+    # Install dep packge , Configure,make and install strongSwan
+    RUN apk --update add build-base curl bash iproute2 iptables-dev openssl openssl-dev supervisor bash certbot \
+        && mkdir -p /tmp/strongswan \
+        && apk add --update $RUNTIME_DEPS \
+        && apk add --virtual build_deps $BUILD_DEPS \
+        && cp /usr/bin/envsubst /usr/local/bin/envsubst \
+        && curl -Lo /tmp/strongswan.tar.gz $SS_VERSION \
+        && tar --strip-components=1 -C /tmp/strongswan -xf /tmp/strongswan.tar.gz \
+        && cd /tmp/strongswan \
+        && ./configure  --enable-eap-identity --enable-eap-md5 --enable-eap-mschapv2 --enable-eap-tls --enable-eap-ttls --enable-eap-peap --enable-eap-tnc --enable-eap-dynamic --enable-xauth-eap --enable-dhcp --enable-openssl --enable-addrblock --enable-unity --enable-certexpire --enable-radattr --enable-swanctl --enable-eap-radius --disable-gmp && make && make install \
+        && rm -rf /tmp/* \
+        && apk del build-base openssl-dev build_deps \
+        && rm -rf /var/cache/apk/* \
+        && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone \
+        && rm /usr/local/etc/ipsec.secrets
+
+    COPY ./run.sh /run.sh
+    COPY ./adduser.sh /adduser.sh
+    COPY ./rmuser.sh /rmuser.sh
+
+    RUN chmod 755 /run.sh /adduser.sh /rmuser.sh
+
+    VOLUME ["/usr/local/etc/ipsec.secrets"]
+
+    EXPOSE 500:500/udp 4500:4500/udp
+
+    CMD ["/run.sh"]
+    
+Для управления пользователями мы создаём два скрипта *adduser.sh*, *rmuser.sh* для добавления и удаления пользователя соответственно.
+
+**adduser.sh**
+
+    #!/bin/sh
+
+    VPN_USER="$1"
+
+    if [ -z "$VPN_USER" ]; then
+      echo "Usage: $0 username" >&2
+      echo "Example: $0 jordi" >&2
+      exit 1
+    fi
+
+    case "$VPN_USER" in
+      *[\\\"\']*)
+        echo "VPN credentials must not contain any of these characters: \\ \" '" >&2
+        exit 1
+        ;;
+    esac
+
+    VPN_PASSWORD="$(openssl rand -base64 9)"
+    HOST="$(printenv VPNHOST)"
+
+    echo "Password for user is: $VPN_PASSWORD"
+    echo $VPN_USER : EAP \"$VPN_PASSWORD\">> /usr/local/etc/ipsec.secrets
+
+    ipsec rereadsecrets
+    
+**rmuser.sh**
+
+    #!/bin/sh
+
+    VPN_USER="$1"
+
+    if [ -z "$VPN_USER" ]; then
+      echo "Usage: $0 username" >&2
+      echo "Example: $0 jordi" >&2
+      exit 1
+    fi
+
+    cp /usr/local/etc/ipsec.secrets /usr/local/etc/ipsec.secrets.bak
+    sed "/$VPN_USER :/d" /usr/local/etc/ipsec.secrets.bak > /usr/local/etc/ipsec.secrets
+
+    ipsec rereadsecrets
+    
+На сервере все пользователи будут храниться в файле **ipsec.secrets**.
+
+Для запуска нашего сервера подготовим следующий скрипт:
+    
+**run.sh**
+
+    #!/bin/bash
+
+    VPNIPPOOL="10.15.1.0/24" # указываем из какого диапазона будут выдаваться IP нашим клиентам, которые будут подключаться к VPN-серверу.
+    LEFT_ID=${VPNHOST}       # домен нашего vpn-сервера
+
+    sysctl net.ipv4.ip_forward=1
+    sysctl net.ipv6.conf.all.forwarding=1
+    sysctl net.ipv6.conf.eth0.proxy_ndp=1
+
+    if [ ! -z "$DNS_SERVERS" ] ; then # можем указать свои DNS сервера, которые будут использоваться в vpn сервере.
+    DNS=$DNS_SERVERS
+    else
+    DNS="1.1.1.1,8.8.8.8"
+    fi
+
+    if [ ! -z "$SPEED_LIMIT" ] ; then # для того, чтобы один пользователь не "съел" весь канал, можем ограничить скорость пользователя до указанной величины.
+    tc qdisc add dev eth0 handle 1: ingress
+    tc filter add dev eth0 parent 1: protocol ip prio 1 u32 match ip src 0.0.0.0/0 police rate ${SPEED_LIMIT}mbit burst 10k drop flowid :1
+    tc qdisc add dev eth0 root tbf rate ${SPEED_LIMIT}mbit latency 25ms burst 10k
+    fi
+
+    iptables -t nat -A POSTROUTING -s ${VPNIPPOOL} -o eth0 -m policy --dir out --pol ipsec -j ACCEPT
+    iptables -t nat -A POSTROUTING -s ${VPNIPPOOL} -o eth0 -j MASQUERADE
+
+    iptables -L
+  
+    # Здесь мы генерируем сертификат сервера
+    if [[ ! -f "/usr/local/etc/ipsec.d/certs/fullchain.pem" && ! -f "/usr/local/etc/ipsec.d/private/privkey.pem" ]] ; then
+        certbot certonly --standalone --preferred-challenges http --agree-tos --no-eff-email --email ${LEEMAIL} -d ${VPNHOST}
+        cp /etc/letsencrypt/live/${VPNHOST}/fullchain.pem /usr/local/etc/ipsec.d/certs
+        cp /etc/letsencrypt/live/${VPNHOST}/privkey.pem /usr/local/etc/ipsec.d/private
+        cp /etc/letsencrypt/live/${VPNHOST}/chain.pem /usr/local/etc/ipsec.d/cacerts
+    fi
+
+    rm -f /var/run/starter.charon.pid
+    
+    # Настройка непосредственно ipsec сервера
+    if [ -f "/usr/local/etc/ipsec.conf" ]; then
+    rm /usr/local/etc/ipsec.conf
+    cat >> /usr/local/etc/ipsec.conf <<EOF
+    config setup
+        charondebug="ike 1, knl 1, cfg 1"
+        uniqueids=never
+        conn ikev2-vpn
+        auto=add
+        compress=no
+        type=tunnel
+        keyexchange=ikev2
+        ike=aes128-sha1-modp1024,aes128-sha1-modp1536,aes128-sha1-modp2048,aes128-sha256-ecp256,aes128-sha256-modp1024,aes128-sha256-modp1536,aes128-sha256-modp2048,aes256-aes128-sha256-sha1-modp2048-modp4096-modp1024,aes256-sha1-modp1024,aes256-sha256-modp1024,aes256-sha256-modp1536,aes256-sha256-modp2048,aes256-sha256-modp4096,aes256-sha384-ecp384,aes256-sha384-modp1024,aes256-sha384-modp1536,aes256-sha384-modp2048,aes256-sha384-modp4096,aes256gcm16-aes256gcm12-aes128gcm16-aes128gcm12-sha256-sha1-modp2048-modp4096-modp1024,3des-sha1-modp1024!
+        esp=aes128-aes256-sha1-sha256-modp2048-modp4096-modp1024,aes128-sha1,aes128-sha1-modp1024,aes128-sha1-modp1536,aes128-sha1-modp2048,aes128-sha256,aes128-sha256-ecp256,aes128-sha256-modp1024,aes128-sha256-modp1536,aes128-sha256-modp2048,aes128gcm12-aes128gcm16-aes256gcm12-aes256gcm16-modp2048-modp4096-modp1024,aes128gcm16,aes128gcm16-ecp256,aes256-sha1,aes256-sha256,aes256-sha256-modp1024,aes256-sha256-modp1536,aes256-sha256-modp2048,aes256-sha256-modp4096,aes256-sha384,aes256-sha384-ecp384,aes256-sha384-modp1024,aes256-sha384-modp1536,aes256-sha384-modp2048,aes256-sha384-modp4096,aes256gcm16,aes256gcm16-ecp384,3des-sha1!
+        fragmentation=yes
+        forceencaps=yes
+        dpdaction=clear
+        dpddelay=300s
+        rekey=no
+        left=%any
+        leftid=@$LEFT_ID
+        leftcert=fullchain.pem
+        leftsendcert=always
+        leftsubnet=0.0.0.0/0
+        right=%any
+        rightid=%any
+        rightauth=eap-mschapv2
+        rightsourceip=10.15.1.0/24
+        rightdns=$DNS
+        rightsendcert=never
+        eap_identity=%identity
+    EOF
+    fi
+
+    if [ ! -f "/usr/local/etc/ipsec.secrets" ]; then
+    cat > /usr/local/etc/ipsec.secrets <<EOF
+    : RSA privkey.pem
+    EOF
+    fi
+    
+    # RADIUS сервер для мониторинга подключений к серверу и сбора статистики
+    if [[ ! -z "$RADIUS_SERVER" && ! -z "$RADIUS_SERVER_SECRET" ]]; then
+    rm /usr/local/etc/strongswan.d/charon/eap-radius.conf
+    cat >> /usr/local/etc/strongswan.d/charon/eap-radius.conf <<EOF
+    eap-radius {
+        accounting = yes
+        accounting_close_on_timeout = no
+        accounting_interval = 300
+        close_all_on_timeout = no
+        load = yes
+        nas_identifier = $VPNHOST
+
+        # Section to specify multiple RADIUS servers.
+        servers {
+            primary {
+                address = $RADIUS_SERVER
+                secret = $RADIUS_SERVER_SECRET
+                auth_port = 1812   # default
+                acct_port = 1813   # default
+            }
+        }
+    }
+    EOF
+    fi
+    sysctl -p
+
+    ipsec start --nofork
+
+Чтобы было проще запустить весь сервер одной командой, завернём всё в docker-compose:
+    
+    version: '3'
+
+    services:
+      vpn:
+        build: .
+        container_name: ikev2-vpn-server
+        privileged: true
+        volumes:
+          - './data/certs/certs:/usr/local/etc/ipsec.d/certs'
+          - './data/certs/private:/usr/local/etc/ipsec.d/private'
+          - './data/certs/cacerts:/usr/local/etc/ipsec.d/cacerts'
+          - './data/etc/ipsec.d/ipsec.secrets:/usr/local/etc/ipsec.secrets'
+        env_file:
+          - .env
+        ports:
+          - '500:500/udp'
+          - '4500:4500/udp'
+          - '80:80'
+        depends_on:
+          - radius
+        links:
+          - radius
+        networks:
+          - backend
+
+      radius:
+        image: 'freeradius/freeradius-server:latest'
+        container_name: freeradius-server
+        volumes:
+          - './freeradius/clients.conf:/etc/raddb/clients.conf'
+          - './freeradius/mods-enabled/rest:/etc/raddb/mods-enabled/rest'
+          - './freeradius/sites-enabled/default:/etc/raddb/sites-enabled/default'
+        env_file:
+          - .env
+        command: radiusd -X
+        networks:
+          - backend
+    networks:
+      backend:
+        ipam:
+          config:
+            - subnet: 10.0.0.0/24
+
+Здесь мы сохраняем в volume ключи сертификата, чтобы при каждом перезапуске сервера, не генерировать их снова.
+
+Пробрасываем порты, необходимые для подключения к серверу, а так же для генереации сертификатов через Let's Encrypt.
+
+Перед запуском и сборкой контэйнеров, необходимо создать и заполнить `.env` файл, в который помещаем следующее:
+      
+    VPNHOST=vpn.vpn.com # домен нашего vpn-сервера
+    LEEMAIL=admin@admin.com # адрес почты, который будет использован для генерации сертификатов Let's Encrypt
+    SPEED_LIMIT=20 # если нужно, то укащываем как лимит скорости в mbit
+    DNS_SERVERS= # если нужно то указываем собственные DNS сервера
+    RADIUS_SERVER= # адрес radius сервера, в нашем случае это будет radius
+    RADIUS_SERVER_SECRET= # секретный ключ, с помощью которого проходит авторизация на radius сервере
+    REMOTE_SERVER= # в эту переменную вынесли endpoint на который отправлялась статистика из radius сервера, об этом расскажу далее.
+
+Выполняя команду `docker-compose up -d` мы запускаем наш vpn-сервер, а так же radius сервер (если он вам нужен).
+
+[Вот так выглядит весь проект в сборке](https://github.com/appbooster/docker-ikev2-vpn-server)
+
+## Сбор статистики с VPN-сервера
+
+Нам ещё было очень интересно сколько пользователей подключено в данный момент к серверу, какой объём траифка потребляется и раздаётся на сервере. Для этих целей было решено подключить Radius сервер. Он в свою очередь получает эти данны от VPN-сервера и уже далее перенаправляет все необходимые данные к нам.
+
+Radius сервер можно использовать и для авторизации пользователей.
+
+Чтобы наши данные уходили на наш endpoint, в файле **/etc/raddb/mods-enabled/rest** настраиваем блок **accounting**, получится что-то вроде:
+
+    accounting {
+		uri = "${..connect_uri}/vpn_sessions/%{Acct-Session-Id}-%{Acct-Unique-Session-ID}"
+    method = 'post'
+    tls = ${..tls}
+    body = json
+    data = '{ "username": "%{User-Name}", "nas_port": "%{NAS-Port}", "nas_ip_address": "%{NAS-IP-Address}", "framed_ip_address": "%{Framed-IP-Address}", "framed_ipv6_prefix": "%{Framed-IPv6-Prefix}", "nas_identifier": "%{NAS-Identifier}", "airespace_wlan_id": "%{Airespace-Wlan-Id}", "acct_session_id": "%{Acct-Session-Id}", "nas_port_type": "%{NAS-Port-Type}", "cisco_avpair": "%{Cisco-AVPair}", "acct_authentic": "%{Acct-Authentic}", "tunnel_type": "%{Tunnel-Type}", "tunnel_medium_type": "%{Tunnel-Medium-Type}", "tunnel_private_group_id": "%{Tunnel-Private-Group-Id}", "event_timestamp": "%{Event-Timestamp}", "acct_status_type": "%{Acct-Status-Type}", "acct_input_octets": "%{Acct-Input-Octets}", "acct_input_gigawords": "%{Acct-Input-Gigawords}", "acct_output_octets": "%{Acct-Output-Octets}", "acct_output_gigawords": "%{Acct-Output-Gigawords}", "acct_input_packets": "%{Acct-Input-Packets}", "acct_output_packets": "%{Acct-Output-Packets}", "acct_terminate_cause": "%{Acct-Terminate-Cause}", "acct_session_time": "%{Acct-Session-Time}", "acct_delay_time": "%{Acct-Delay-Time}", "calling_station_id": "%{Calling-Station-Id}", "called_station_id": "%{Called-Station-Id}"}'
+
+	 }
+   
+Здесь мы можем как угодно комбинировать данные и отпралять на наш сервер.
+
+При настройке VPN сервера столкнулись с некоторыми нюансами, вроде таких, что устройства Apple не могут подключить к серверу, если на нём будет самоподписанный сертификат, всё заработало только после того как сертификат начали генерировать через Let's Encrypt.
+
+В итоге, у нас получилось поднять VPN-сервер с авторизацией по логину и паролю + наладить передачу статистических данных, для контроля за серверами, не более :)
+
+Данную статью можно использовать как пример того, как можно настроить личный VPN-сервер, как работает подключение к серверу, как настраивается авторизация, сбор статистики с сервера.
